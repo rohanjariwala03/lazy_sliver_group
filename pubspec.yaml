@@ -1,0 +1,23 @@
+name: lazy_sliver_group
+description: A SliverMainAxisGroup that builds its groups lazily. Show thousands of sliver groups, such as chat days with pinned headers, and build only the visible ones.
+version: 0.1.0
+repository: https://github.com/rohanjariwala03/lazy_sliver_group
+issue_tracker: https://github.com/rohanjariwala03/lazy_sliver_group/issues
+topics:
+  - sliver
+  - list
+  - scroll
+  - sticky-header
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
