@@ -167,6 +167,63 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  // Groups whose SliverList estimates its own extent, as real content does.
+  Widget variableGroup(BuildContext context, int group) => SliverMainAxisGroup(
+        slivers: <Widget>[
+          PinnedHeaderSliver(child: SizedBox(height: headerExtent, child: Text('header $group'))),
+          SliverList.builder(
+            itemCount: 5 + group % 30,
+            itemBuilder: (BuildContext context, int item) => SizedBox(
+                height: 20.0 + (group * 37 + item * 13) % 200, child: Text('g$group i$item')),
+          ),
+        ],
+      );
+
+  testWidgets('the scroll offset follows scrolling up after a jump', (WidgetTester tester) async {
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: CustomScrollView(
+          controller: controller,
+          slivers: <Widget>[
+            LazySliverMainAxisGroup(groupCount: 2000, groupBuilder: variableGroup),
+          ],
+        ),
+      ),
+    );
+    controller.jumpTo(80000);
+    await tester.pump();
+
+    for (var step = 0; step < 12; step++) {
+      final double before = controller.offset;
+      controller.jumpTo(before - 500);
+      await tester.pump();
+      // Corrections are limited to the error of the groups that were just
+      // measured, not the estimate for every unbuilt group above.
+      expect((controller.offset - before).abs(), lessThan(2000));
+    }
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('estimates its extent when it starts below the cache area', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: CustomScrollView(
+          controller: controller,
+          slivers: <Widget>[
+            const SliverToBoxAdapter(child: SizedBox(height: 2000)),
+            LazySliverMainAxisGroup(groupCount: 100, groupBuilder: variableGroup),
+          ],
+        ),
+      ),
+    );
+
+    expect(controller.position.maxScrollExtent, greaterThan(2000 + 100 * headerExtent - 600));
+  });
+
   testWidgets('works in a reversed scroll view', (WidgetTester tester) async {
     await pumpGroups(tester, reverse: true);
 

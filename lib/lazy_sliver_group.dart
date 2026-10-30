@@ -174,6 +174,16 @@ class _RenderLazyGroup extends RenderSliver
   // O(groupCount). Use a Fenwick tree if lists reach hundreds of thousands.
   final List<double?> _extents = <double?>[];
 
+  /// Whether the extent in [_extents] was measured with the whole group built,
+  /// so it is not itself an estimate of a partly built list.
+  final List<bool> _exact = <bool>[];
+
+  /// The group at the top of the viewport after the last layout, and its
+  /// offset. Its position must not change, so that the content on screen does
+  /// not move when the extents of groups above it are corrected.
+  int? _anchorIndex;
+  double _anchorOffset = 0;
+
   @override
   void setupParentData(RenderObject child) {
     if (child.parentData is! _GroupParentData) {
@@ -183,16 +193,27 @@ class _RenderLazyGroup extends RenderSliver
 
   int _indexOf(RenderSliver child) => (child.parentData! as _GroupParentData).index;
 
+  /// The average extent of the measured groups, preferring exact ones.
   double? _averageExtent() {
     var sum = 0.0;
-    var measured = 0;
-    for (final double? extent in _extents) {
+    var count = 0;
+    var exactSum = 0.0;
+    var exactCount = 0;
+    for (var i = 0; i < _extents.length; i++) {
+      final double? extent = _extents[i];
       if (extent != null) {
         sum += extent;
-        measured++;
+        count++;
+        if (_exact[i]) {
+          exactSum += extent;
+          exactCount++;
+        }
       }
     }
-    return measured == 0 ? null : sum / measured;
+    if (exactCount > 0) {
+      return exactSum / exactCount;
+    }
+    return count == 0 ? null : sum / count;
   }
 
   /// Returns the group at [index] after [after], and whether it was created.
@@ -205,14 +226,6 @@ class _RenderLazyGroup extends RenderSliver
       _element.createGroup(index, after: after);
     });
     return (after == null ? firstChild! : childAfter(after)!, true);
-  }
-
-  double _estimatedOffsetOf(int index, double averageExtent) {
-    var offset = 0.0;
-    for (var i = 0; i < index; i++) {
-      offset += _extents[i] ?? averageExtent;
-    }
-    return offset;
   }
 
   void _removeGroup(RenderSliver child) {
@@ -228,44 +241,57 @@ class _RenderLazyGroup extends RenderSliver
     final int groupCount = _element.groupCount;
     if (_extents.length > groupCount) {
       _extents.length = groupCount;
+      _exact.length = groupCount;
     } else {
       _extents.addAll(List<double?>.filled(groupCount - _extents.length, null));
+      _exact.addAll(List<bool>.filled(groupCount - _exact.length, false));
+    }
+    if (_anchorIndex != null && _anchorIndex! >= groupCount) {
+      _anchorIndex = null;
     }
 
     final double scrollOffset = constraints.scrollOffset;
     final double cacheStart = scrollOffset + constraints.cacheOrigin;
     final double cacheEnd = cacheStart + constraints.remainingCacheExtent;
     final double? averageExtent = _averageExtent();
+    double extentOf(int index) => _extents[index] ?? averageExtent ?? 0;
 
-    // The built groups must not move on screen when the estimate for the
-    // unbuilt groups before them changes. Shift them and the scroll offset by
-    // the same amount instead.
-    if (firstChild != null && averageExtent != null) {
-      final firstParentData = firstChild!.parentData! as _GroupParentData;
-      final double drift = _fixPrecisionError(
-        _estimatedOffsetOf(firstParentData.index, averageExtent) - firstParentData.layoutOffset,
-      );
-      if (drift != 0) {
-        for (RenderSliver? child = firstChild; child != null; child = childAfter(child)) {
-          (child.parentData! as _GroupParentData).layoutOffset += drift;
-        }
-        geometry = SliverGeometry(scrollOffsetCorrection: drift);
-        return;
-      }
-    }
-
-    // Find the first group that reaches into the cache area, from the measured
-    // or estimated extents of the groups before it. Nothing before it is built.
+    // Find the first group that reaches into the cache area. Positions are
+    // taken relative to the built groups, so a changing estimate for unbuilt
+    // groups never moves a built one.
     var firstIndex = 0;
     var firstOffset = 0.0;
-    if (averageExtent != null) {
-      while (firstIndex < groupCount - 1) {
-        final double extent = _extents[firstIndex] ?? averageExtent;
-        if (firstOffset + extent > cacheStart) {
-          break;
+    if (firstChild != null) {
+      firstIndex = _indexOf(firstChild!);
+      firstOffset = (firstChild!.parentData! as _GroupParentData).layoutOffset;
+      while (firstIndex > 0 && firstOffset > cacheStart) {
+        firstIndex--;
+        firstOffset -= extentOf(firstIndex);
+      }
+    }
+    while (averageExtent != null &&
+        firstIndex < groupCount - 1 &&
+        firstOffset + extentOf(firstIndex) <= cacheStart) {
+      firstOffset += extentOf(firstIndex);
+      firstIndex++;
+    }
+
+    // Estimates for the groups before the built ones were off, so the first
+    // group would not be at 0. Move everything, and the scroll offset, so that
+    // it is.
+    if (firstOffset < 0 || firstIndex == 0) {
+      var firstGroupOffset = firstOffset;
+      for (var i = 0; i < firstIndex; i++) {
+        firstGroupOffset -= extentOf(i);
+      }
+      final double shift = _fixPrecisionError(-firstGroupOffset);
+      if (shift != 0) {
+        for (RenderSliver? child = firstChild; child != null; child = childAfter(child)) {
+          (child.parentData! as _GroupParentData).layoutOffset += shift;
         }
-        firstOffset += extent;
-        firstIndex++;
+        _anchorOffset += shift;
+        geometry = SliverGeometry(scrollOffsetCorrection: shift);
+        return;
       }
     }
 
@@ -282,18 +308,19 @@ class _RenderLazyGroup extends RenderSliver
     double cacheOrigin = constraints.cacheOrigin;
     double remainingCacheExtent = constraints.remainingCacheExtent;
 
+    double maxScrollObstructionExtent = 0;
     double scrollOffsetCorrection = 0;
-    var anchored = false;
     RenderSliver? previous;
     var index = firstIndex;
-    while (index < groupCount && groupOffset < cacheEnd) {
+    // Lay out at least one group, so that there is an estimate for the others
+    // even when this sliver starts below the cache area.
+    while (index < groupCount &&
+        (groupOffset < cacheEnd || (previous == null && averageExtent == null))) {
       final (RenderSliver child, bool created) = _obtainGroup(index, after: previous);
       final childParentData = child.parentData! as _GroupParentData;
-      // The first group that was already built stays where it was on screen.
-      // If the groups built before it moved it, correct the scroll offset.
-      if (!created && !anchored) {
-        anchored = true;
-        scrollOffsetCorrection = groupOffset - childParentData.layoutOffset;
+      if (index == _anchorIndex && !created) {
+        scrollOffsetCorrection = _fixPrecisionError(groupOffset - _anchorOffset);
+        _anchorOffset = groupOffset;
       }
       final double beforeOffsetPaintExtent = calculatePaintOffset(
         constraints,
@@ -327,6 +354,8 @@ class _RenderLazyGroup extends RenderSliver
       }
 
       _extents[index] = childGeometry.scrollExtent;
+      _exact[index] =
+          groupOffset >= cacheStart && groupOffset + childGeometry.scrollExtent <= cacheEnd;
       childParentData.layoutOffset = groupOffset;
       final double childPaintOffset = layoutOffset + childGeometry.paintOrigin;
       childParentData.paintOffset = switch (constraints.axis) {
@@ -336,6 +365,7 @@ class _RenderLazyGroup extends RenderSliver
       groupOffset += childGeometry.scrollExtent;
       layoutOffset += childGeometry.layoutExtent;
       maxPaintExtent += childGeometry.maxPaintExtent;
+      maxScrollObstructionExtent += childGeometry.maxScrollObstructionExtent;
       paintOffset = math.max(childPaintOffset + childGeometry.paintExtent, paintOffset);
       if (childGeometry.cacheExtent != 0.0) {
         remainingCacheExtent = _fixPrecisionError(
@@ -347,7 +377,7 @@ class _RenderLazyGroup extends RenderSliver
       index++;
     }
 
-    if (_fixPrecisionError(scrollOffsetCorrection) != 0) {
+    if (scrollOffsetCorrection != 0) {
       geometry = SliverGeometry(scrollOffsetCorrection: scrollOffsetCorrection);
       return;
     }
@@ -357,6 +387,16 @@ class _RenderLazyGroup extends RenderSliver
       final RenderSliver? next = childAfter(trailing);
       _removeGroup(trailing);
       trailing = next;
+    }
+
+    _anchorIndex = null;
+    for (RenderSliver? child = firstChild; child != null; child = childAfter(child)) {
+      final childParentData = child.parentData! as _GroupParentData;
+      if (childParentData.layoutOffset + child.geometry!.scrollExtent > scrollOffset) {
+        _anchorIndex = childParentData.index;
+        _anchorOffset = childParentData.layoutOffset;
+        break;
+      }
     }
 
     // Groups after the last built one are estimated.
@@ -370,6 +410,8 @@ class _RenderLazyGroup extends RenderSliver
     // Keep pinned children within the end of this sliver.
     final double remainingExtent = math.max(0, scrollExtent - scrollOffset);
     if (paintOffset > remainingExtent) {
+      final bool pinnedChildrenOverflow =
+          maxScrollObstructionExtent > remainingExtent - constraints.overlap;
       final double paintCorrection = paintOffset - remainingExtent;
       paintOffset = remainingExtent;
       for (RenderSliver? child = firstChild; child != null; child = childAfter(child)) {
@@ -378,7 +420,9 @@ class _RenderLazyGroup extends RenderSliver
           Axis.vertical => childParentData.paintOffset.dy,
           Axis.horizontal => childParentData.paintOffset.dx,
         };
-        if (childMainAxisPaintOffset + child.geometry!.paintExtent > remainingExtent) {
+        final bool childIsPinned = child.geometry!.maxScrollObstructionExtent > 0;
+        if (childMainAxisPaintOffset + child.geometry!.paintExtent > remainingExtent ||
+            (pinnedChildrenOverflow && childIsPinned)) {
           childParentData.paintOffset = switch (constraints.axis) {
             Axis.vertical => Offset(0.0, childParentData.paintOffset.dy - paintCorrection),
             Axis.horizontal => Offset(childParentData.paintOffset.dx - paintCorrection, 0.0),
